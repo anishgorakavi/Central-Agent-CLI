@@ -5,7 +5,8 @@ use crate::ui;
 use anyhow::Result;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind,
 };
 use ratatui::crossterm::execute;
 use std::sync::mpsc::Receiver;
@@ -17,15 +18,23 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Runs the TUI until the user quits, restoring the terminal on every exit path including panics.
 pub fn run(app: &mut App, events: Receiver<UiEvent>) -> Result<()> {
     let mut terminal = ratatui::init();
-    execute!(std::io::stdout(), EnableMouseCapture)?;
+    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
     // ratatui's own panic hook restores the screen but not mouse capture.
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        let _ = execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         previous_hook(info);
     }));
     let result = event_loop(&mut terminal, app, &events);
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     ratatui::restore();
     result
 }
@@ -40,12 +49,16 @@ fn event_loop(
         while let Ok(event) = events.try_recv() {
             app.apply(event);
         }
+        let size = terminal.size()?;
+        let screen = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+        app.sync_terminal(ui::terminal_rect(screen, ui::sidebar_width(app)));
         terminal.draw(|frame| ui::draw(frame, app))?;
         if event::poll(POLL_INTERVAL)? {
             match event::read()? {
                 // Windows also reports key releases; acting on them would double every keystroke.
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.key(key),
                 Event::Mouse(mouse) => app.mouse(mouse),
+                Event::Paste(text) => app.paste(&text),
                 _ => {}
             }
         }

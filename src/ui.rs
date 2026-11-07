@@ -1,4 +1,4 @@
-//! TUI rendering: sidebar, transcript, activity pane, message box, status bar and the permission dialog.
+//! TUI rendering: sidebar, the embedded real-CLI terminal or chat transcript, activity pane, message box, status bar and dialogs.
 use crate::app::{Action, App, Entry, Role, Status};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -13,20 +13,58 @@ const SIDEBAR_PADDING: u16 = 6;
 const AUTO_APPROVE_WIDTH: u16 = 22;
 const DIALOG_MAX_WIDTH: u16 = 72;
 const MAX_PICKER_ROWS: usize = 15;
+// Activity line and status bar under an embedded terminal.
+const NATIVE_FOOTER_ROWS: u16 = 2;
+const CHAT_HINTS: &str = " click agent/switch | Tab: next agent | wheel/PgUp/PgDn: scroll | Alt+Left/Right: word | Ctrl+C: quit";
+const NATIVE_HINTS: &str =
+    " Ctrl+] then: n/p switch agent | 1-9 pick | a auto-approve | r resume | q quit";
+const PREFIX_PENDING_HINTS: &str =
+    " Ctrl+] ... press n/p (switch), 1-9, a (auto-approve), r (resume), q (quit), Esc to cancel";
+
+/// Width of the agent sidebar: the longest agent name plus room for the dot, marker and border.
+pub fn sidebar_width(app: &App) -> u16 {
+    app.chats
+        .iter()
+        .map(|c| c.name.len() as u16)
+        .max()
+        .unwrap_or(0)
+        + SIDEBAR_PADDING
+}
+
+/// Screen area an embedded terminal occupies: everything right of the sidebar except the
+/// two bottom rows (activity line and status bar). The event loop sizes the pty from this.
+pub fn terminal_rect(area: Rect, sidebar_width: u16) -> Rect {
+    Rect::new(
+        area.x + sidebar_width,
+        area.y,
+        area.width.saturating_sub(sidebar_width),
+        area.height.saturating_sub(NATIVE_FOOTER_ROWS),
+    )
+}
 
 /// Draws the whole screen and records click targets into `app.hitboxes`.
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.hitboxes.clear();
     let area = frame.area();
+    let sidebar_width = sidebar_width(app);
+    if app.chat().native {
+        draw_native(frame, app, area, sidebar_width);
+    } else {
+        draw_chat(frame, app, area, sidebar_width);
+    }
+    if app.picker.is_some() {
+        draw_picker_dialog(frame, app, area);
+    }
+    // Permission prompts are urgent (an agent is blocked), so they sit on top of the picker.
+    if !app.permissions.is_empty() {
+        draw_permission_dialog(frame, app, area);
+    }
+}
+
+/// Layout for chat tabs: sidebar, transcript, activity pane, message box, status bar.
+fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect, sidebar_width: u16) {
     let [main, status_bar] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
-    let sidebar_width = app
-        .chats
-        .iter()
-        .map(|c| c.name.len() as u16)
-        .max()
-        .unwrap_or(0)
-        + SIDEBAR_PADDING;
     let [sidebar, content] =
         Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(10)]).areas(main);
     let [transcript, activity, input] = Layout::vertical([
@@ -40,14 +78,119 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_transcript(frame, app, transcript);
     draw_activity(frame, app, activity);
     draw_input(frame, app, input);
-    draw_status_bar(frame, app, status_bar);
-    if app.picker.is_some() {
-        draw_picker_dialog(frame, app, area);
+    draw_status_bar(frame, app, status_bar, CHAT_HINTS);
+}
+
+/// Layout for native tabs: sidebar, the real CLI filling the rest, one activity line, status bar.
+/// The pty size never depends on activity, so the program inside is not reflowed when delegations happen.
+fn draw_native(frame: &mut Frame, app: &mut App, area: Rect, sidebar_width: u16) {
+    let terminal = terminal_rect(area, sidebar_width);
+    let sidebar = Rect::new(
+        area.x,
+        area.y,
+        sidebar_width.min(area.width),
+        terminal.height,
+    );
+    let footer_y = area.y + terminal.height;
+    let activity_line = Rect::new(area.x, footer_y, area.width, 1);
+    let status_bar = Rect::new(area.x, footer_y + 1, area.width, 1);
+
+    draw_sidebar(frame, app, sidebar);
+    draw_terminal(frame, app, terminal);
+    let latest = app.activity.last().map(String::as_str).unwrap_or("");
+    frame.render_widget(
+        Paragraph::new(format!(" A2A: {latest}")).style(Style::default().fg(Color::Magenta)),
+        activity_line,
+    );
+    let hints = if app.prefix_pending {
+        PREFIX_PENDING_HINTS
+    } else {
+        NATIVE_HINTS
+    };
+    draw_status_bar(frame, app, status_bar, hints);
+}
+
+/// Paints the selected tab's emulated screen into `area`, and places the cursor where the program put it.
+fn draw_terminal(frame: &mut Frame, app: &App, area: Rect) {
+    let chat = app.chat();
+    let Some(pane) = &chat.pane else {
+        let text = match chat.entries.last() {
+            Some(entry) => format!("could not start {}: {}", chat.name, entry.text),
+            None => format!("starting {}...", chat.name),
+        };
+        frame.render_widget(Paragraph::new(text), area);
+        return;
+    };
+    let show_cursor = !app.dialog_open();
+    let cursor = pane.with_screen(|screen| {
+        paint_screen(frame, screen, area);
+        let (row, col) = screen.cursor_position();
+        (!screen.hide_cursor() && screen.scrollback() == 0 && row < area.height && col < area.width)
+            .then_some((area.x + col, area.y + row))
+    });
+    if let (true, Some(position)) = (show_cursor, cursor) {
+        frame.set_cursor_position(position);
     }
-    // Permission prompts are urgent (an agent is blocked), so they sit on top of the picker.
-    if !app.permissions.is_empty() {
-        draw_permission_dialog(frame, app, area);
+    if !pane.is_alive() {
+        draw_exited_banner(frame, area, &chat.name);
     }
+}
+
+/// Copies every cell of the emulated screen (text, colors, attributes) into the frame buffer.
+fn paint_screen(frame: &mut Frame, screen: &vt100::Screen, area: Rect) {
+    let buffer = frame.buffer_mut();
+    for row in 0..area.height {
+        for col in 0..area.width {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let mut style = Style::default()
+                .fg(convert_color(cell.fgcolor()))
+                .bg(convert_color(cell.bgcolor()));
+            for (on, modifier) in [
+                (cell.bold(), Modifier::BOLD),
+                (cell.dim(), Modifier::DIM),
+                (cell.italic(), Modifier::ITALIC),
+                (cell.underline(), Modifier::UNDERLINED),
+                (cell.inverse(), Modifier::REVERSED),
+            ] {
+                if on {
+                    style = style.add_modifier(modifier);
+                }
+            }
+            let symbol = if cell.has_contents() {
+                cell.contents()
+            } else {
+                " "
+            };
+            buffer[(area.x + col, area.y + row)]
+                .set_symbol(symbol)
+                .set_style(style);
+        }
+    }
+}
+
+/// Maps an emulator color to a ratatui color; the default color stays the host terminal's own.
+fn convert_color(color: vt100::Color) -> Color {
+    match color {
+        vt100::Color::Default => Color::Reset,
+        vt100::Color::Idx(index) => Color::Indexed(index),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+/// One-line notice over the bottom of the terminal telling how to relaunch a finished program.
+fn draw_exited_banner(frame: &mut Frame, area: Rect, name: &str) {
+    let banner = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
+    let text =
+        format!(" {name} exited - Enter: start again | Ctrl+] r: resume a past conversation ");
+    frame.render_widget(
+        Paragraph::new(text).style(Style::default().fg(Color::Black).bg(Color::Yellow)),
+        banner,
+    );
 }
 
 /// Agent list; each row is clickable.
@@ -209,8 +352,8 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Bottom bar: clickable auto-approve switch and key hints.
-fn draw_status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
+/// Bottom bar: clickable auto-approve switch and the given key hints.
+fn draw_status_bar(frame: &mut Frame, app: &mut App, area: Rect, text: &str) {
     let on = app.auto_allow.load(Ordering::Relaxed);
     let (label, color) = if on {
         ("auto-approve: ON ", Color::Red)
@@ -229,7 +372,6 @@ fn draw_status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
         area.width.saturating_sub(switch.width),
         1,
     );
-    let text = " click agent/switch | Tab: next agent | wheel/PgUp/PgDn: scroll | Ctrl+C: quit";
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
         hints,
@@ -345,17 +487,28 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, mpsc};
 
-    /// An app with no agents configured, for rendering tests.
+    /// An app with the chat-only agent `local` selected, for rendering tests.
     fn app() -> App {
         let env = Env {
-            config: Arc::new(Config::default()),
+            config: Arc::new(
+                serde_json::from_str::<Config>(
+                    r#"{"agents": {"local": {"kind": "ollama", "model": "m"}}}"#,
+                )
+                .unwrap(),
+            ),
             exe: PathBuf::from("central"),
             cwd: PathBuf::from("."),
             a2a_url: String::new(),
             token: String::new(),
             ui: mpsc::channel().0,
         };
-        App::new(env, Arc::new(AtomicBool::new(false)))
+        let mut app = App::new(env, Arc::new(AtomicBool::new(false)));
+        app.selected = app
+            .chats
+            .iter()
+            .position(|chat| chat.name == "local")
+            .unwrap();
+        app
     }
 
     /// Renders one frame to an 80x24 test buffer and returns its text.
@@ -402,7 +555,7 @@ mod tests {
         use crate::worker::Command;
         let mut app = app();
         let (worker, inbox) = mpsc::channel();
-        app.chats[0].worker = Some(worker);
+        app.chats[app.selected].worker = Some(worker);
         let sessions = vec![
             SessionInfo {
                 id: "s1".into(),
@@ -415,7 +568,7 @@ mod tests {
                 updated_at: None,
             },
         ];
-        let agent = app.chats[0].name.clone();
+        let agent = app.chats[app.selected].name.clone();
         app.apply(UiEvent::Agent {
             agent,
             event: AgentEvent::Sessions(sessions),
@@ -449,16 +602,58 @@ mod tests {
     fn transcript_clamps_scroll_and_shows_latest() {
         let mut app = app();
         for i in 0..50 {
-            app.chats[0].entries.push(Entry {
+            app.chats[app.selected].entries.push(Entry {
                 role: Role::Agent,
                 text: format!("line {i}"),
             });
         }
-        app.chats[0].scroll_up = 10_000;
+        app.chats[app.selected].scroll_up = 10_000;
         let text = screen(&mut app);
         assert!(text.contains("line 0") && !text.contains("line 49"));
-        assert!(app.chats[0].scroll_up < 10_000);
-        app.chats[0].scroll_up = 0;
+        assert!(app.chats[app.selected].scroll_up < 10_000);
+        app.chats[app.selected].scroll_up = 0;
         assert!(screen(&mut app).contains("line 49"));
+    }
+
+    // A native tab paints the embedded program's screen, colors included, next to the sidebar.
+    #[test]
+    fn native_tab_shows_the_programs_screen() {
+        use crate::config::Launch;
+        let mut app = app();
+        app.selected = app.chats.iter().position(|chat| chat.native).unwrap();
+        let launch = Launch {
+            program: "sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "printf '\\033[38;2;217;119;87mCLAWD\\033[0m ready'; sleep 5".to_owned(),
+            ],
+            env: Default::default(),
+        };
+        let area = terminal_rect(Rect::new(0, 0, 80, 24), sidebar_width(&app));
+        app.chats[app.selected].pane = Some(
+            crate::pty_pane::PtyPane::spawn(
+                &launch,
+                std::path::Path::new("."),
+                area.height,
+                area.width,
+            )
+            .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        loop {
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            if terminal.backend().to_string().contains("CLAWD ready") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "screen never showed program output"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let cell = &terminal.backend().buffer()[(area.x, area.y)];
+        assert_eq!(cell.fg, ratatui::style::Color::Rgb(217, 119, 87));
+        assert_eq!(app.hitboxes.len(), app.chats.len() + 1);
     }
 }

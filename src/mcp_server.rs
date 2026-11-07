@@ -11,6 +11,28 @@ const IMAGE_DIR_NAME: &str = "generated-images";
 /// Environment variable carrying the A2A bearer token, so it never appears in a process listing.
 pub const TOKEN_ENV: &str = "CENTRAL_A2A_TOKEN";
 
+/// Command-line arguments that make this binary run as the MCP bridge for `caller`.
+pub fn bridge_args(
+    config_path: &Path,
+    a2a_url: &str,
+    caller: &str,
+    image_agent: &str,
+) -> Vec<String> {
+    [
+        "--config",
+        &config_path.to_string_lossy(),
+        "mcp",
+        "--a2a-url",
+        a2a_url,
+        "--caller",
+        caller,
+        "--image-agent",
+        image_agent,
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
 /// The ACP `mcpServers` entry that makes `caller` launch this binary as its delegation toolbox.
 pub fn session_entry(
     exe: &Path,
@@ -23,7 +45,7 @@ pub fn session_entry(
     json!({
         "name": "central",
         "command": exe,
-        "args": ["--config", config_path, "mcp", "--a2a-url", a2a_url, "--caller", caller, "--image-agent", image_agent],
+        "args": bridge_args(config_path, a2a_url, caller, image_agent),
         "env": [{"name": TOKEN_ENV, "value": token}],
     })
 }

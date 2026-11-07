@@ -2,7 +2,10 @@
 use crate::acp_client::{AgentEvent, SessionInfo};
 use crate::config::Config;
 use crate::event::{PermissionRequest, UiEvent, decider};
+use crate::keys;
 use crate::mcp_server;
+use crate::pty_pane::PtyPane;
+use crate::terminal_agents::{self, Bridge};
 use crate::worker::{self, Command};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -17,6 +20,9 @@ use std::sync::mpsc::Sender;
 const MAX_ACTIVITY_LINES: usize = 200;
 const WHEEL_LINES: usize = 3;
 const PAGE_LINES: usize = 10;
+/// Ctrl+] starts a chord in embedded terminals, where every other key belongs to the program inside.
+const PREFIX_KEY: char = ']';
+const PREFIX_BYTE: u8 = 0x1d;
 
 /// Who or what produced a transcript entry; controls how it is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +49,8 @@ pub enum Status {
     Busy,
 }
 
-/// One agent's tab: transcript plus the channel to its worker thread (None until first message).
+/// One agent's tab. Native tabs embed the agent's real CLI in `pane`; the rest are chat tabs with a
+/// transcript and a channel to their ACP worker thread (None until the first message).
 pub struct Chat {
     pub name: String,
     pub entries: Vec<Entry>,
@@ -51,6 +58,13 @@ pub struct Chat {
     pub worker: Option<Sender<Command>>,
     /// Lines scrolled up from the bottom; the renderer clamps it to the transcript length.
     pub scroll_up: usize,
+    /// True when this agent runs as its real CLI in an embedded terminal.
+    pub native: bool,
+    pub pane: Option<PtyPane>,
+    /// Set once a launch was tried, so a failing CLI is not respawned on every frame.
+    pub launch_attempted: bool,
+    /// Start the CLI in its resume mode on the next launch.
+    pub resume_next: bool,
 }
 
 /// What clicking a screen region does.
@@ -93,6 +107,10 @@ pub struct App {
     /// Click targets recorded by the last draw, in paint order (topmost last).
     pub hitboxes: Vec<(Rect, Action)>,
     pub quit: bool,
+    /// Screen area of the embedded terminal, recorded by the event loop before each draw.
+    pub terminal_area: Rect,
+    /// True after Ctrl+] while the next key is a chord command.
+    pub prefix_pending: bool,
     env: Env,
 }
 
@@ -104,11 +122,15 @@ impl App {
             .agent_names()
             .into_iter()
             .map(|name| Chat {
+                native: terminal_agents::is_native(&name) && !env.config.agents.contains_key(&name),
                 name,
                 entries: Vec::new(),
                 status: Status::Offline,
                 worker: None,
                 scroll_up: 0,
+                pane: None,
+                launch_attempted: false,
+                resume_next: false,
             })
             .collect();
         App {
@@ -122,6 +144,8 @@ impl App {
             auto_allow,
             hitboxes: Vec::new(),
             quit: false,
+            terminal_area: Rect::default(),
+            prefix_pending: false,
             env,
         }
     }
@@ -167,7 +191,12 @@ impl App {
 
     /// Handles a key press. A pending permission prompt captures the keyboard.
     pub fn key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        let native = self.chats[self.selected].native;
+        // In an embedded terminal Ctrl+C belongs to the program inside (it interrupts Claude).
+        if !native
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('c')
+        {
             self.quit = true;
             return;
         }
@@ -189,8 +218,18 @@ impl App {
             }
             return;
         }
+        if native {
+            self.native_key(key);
+            return;
+        }
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Enter => self.submit(),
+            KeyCode::Left if alt => self.cursor = self.word_left(),
+            KeyCode::Right if alt => self.cursor = self.word_right(),
+            // Terminals that send Option+arrow as ESC b / ESC f arrive as Alt+b / Alt+f.
+            KeyCode::Char('b') if alt => self.cursor = self.word_left(),
+            KeyCode::Char('f') if alt => self.cursor = self.word_right(),
             KeyCode::Char(c) => {
                 self.input.insert(self.cursor, c);
                 self.cursor += 1;
@@ -220,24 +259,237 @@ impl App {
         }
     }
 
-    /// Handles mouse clicks on recorded hitboxes and wheel scrolling.
+    /// Handles a mouse event: clicks on recorded hitboxes first, then the embedded terminal
+    /// (forwarded if the program asked for the mouse, else the wheel scrolls its history),
+    /// then wheel scrolling of a chat transcript.
     pub fn mouse(&mut self, mouse: MouseEvent) {
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                let hit = self
-                    .hitboxes
-                    .iter()
-                    .rev()
-                    .find(|(rect, _)| rect.contains((mouse.column, mouse.row).into()))
-                    .map(|(_, action)| *action);
-                if let Some(action) = hit {
-                    self.perform(action);
-                }
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            let hit = self
+                .hitboxes
+                .iter()
+                .rev()
+                .find(|(rect, _)| rect.contains((mouse.column, mouse.row).into()))
+                .map(|(_, action)| *action);
+            if let Some(action) = hit {
+                self.perform(action);
+                return;
             }
+        }
+        if self.dialog_open() {
+            return;
+        }
+        let inside_terminal = self
+            .terminal_area
+            .contains((mouse.column, mouse.row).into());
+        if self.chats[self.selected].native {
+            if inside_terminal {
+                self.forward_mouse(mouse);
+            }
+            return;
+        }
+        match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll(WHEEL_LINES as isize),
             MouseEventKind::ScrollDown => self.scroll(-(WHEEL_LINES as isize)),
             _ => {}
         }
+    }
+
+    /// True while a permission prompt or the session picker is on screen.
+    pub fn dialog_open(&self) -> bool {
+        !self.permissions.is_empty() || self.picker.is_some()
+    }
+
+    /// Sends a mouse event to the selected embedded terminal. Programs that did not enable mouse
+    /// reporting do not get it; the wheel then scrolls the terminal's own history instead.
+    fn forward_mouse(&mut self, mouse: MouseEvent) {
+        let area = self.terminal_area;
+        let Some(pane) = self.chats[self.selected]
+            .pane
+            .as_mut()
+            .filter(|p| p.is_alive())
+        else {
+            return;
+        };
+        let (mode, encoding) =
+            pane.with_screen(|s| (s.mouse_protocol_mode(), s.mouse_protocol_encoding()));
+        let encoded = keys::encode_mouse(
+            mouse,
+            mouse.column - area.x,
+            mouse.row - area.y,
+            mode,
+            encoding,
+        );
+        match (encoded, mouse.kind) {
+            (Some(bytes), _) => pane.write(&bytes),
+            (None, MouseEventKind::ScrollUp) => pane.scroll(WHEEL_LINES as isize),
+            (None, MouseEventKind::ScrollDown) => pane.scroll(-(WHEEL_LINES as isize)),
+            _ => {}
+        }
+    }
+
+    /// Handles pasted text: into the embedded terminal (bracketed if it asked), or the message box.
+    pub fn paste(&mut self, text: &str) {
+        if self.dialog_open() {
+            return;
+        }
+        if self.chats[self.selected].native {
+            if let Some(pane) = self.chats[self.selected]
+                .pane
+                .as_mut()
+                .filter(|p| p.is_alive())
+            {
+                let bracketed = pane.with_screen(|s| s.bracketed_paste());
+                pane.write(&keys::encode_paste(text, bracketed));
+            }
+            return;
+        }
+        for c in text
+            .chars()
+            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        {
+            self.input.insert(self.cursor, c);
+            self.cursor += 1;
+        }
+    }
+
+    /// Handles a key while an embedded terminal is selected: Ctrl+] starts a chord, everything else
+    /// goes to the program. After the chord key: n/p or Tab/Shift+Tab switch tab, 1-9 pick a tab,
+    /// a toggles auto-approve, r restarts in resume mode, q quits, and Ctrl+] again sends a literal Ctrl+].
+    fn native_key(&mut self, key: KeyEvent) {
+        // Terminals send Ctrl+] as byte 0x1d, which crossterm reports as Ctrl+5.
+        let is_prefix = matches!(key.code, KeyCode::Char(PREFIX_KEY | '5'))
+            && key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.prefix_pending {
+            self.prefix_pending = false;
+            let count = self.chats.len();
+            match key.code {
+                KeyCode::Char('n') | KeyCode::Tab => self.selected = (self.selected + 1) % count,
+                KeyCode::Char('p') | KeyCode::BackTab => {
+                    self.selected = (self.selected + count - 1) % count
+                }
+                KeyCode::Char(digit @ '1'..='9') => {
+                    let index = digit as usize - '1' as usize;
+                    if index < count {
+                        self.selected = index;
+                    }
+                }
+                KeyCode::Char('a') => self.perform(Action::ToggleAutoApprove),
+                KeyCode::Char('r') => self.restart_native(self.selected, true),
+                KeyCode::Char('q') => self.quit = true,
+                _ if is_prefix => self.write_to_selected_pane(&[PREFIX_BYTE]),
+                _ => {}
+            }
+            return;
+        }
+        if is_prefix {
+            self.prefix_pending = true;
+            return;
+        }
+        let chat = &mut self.chats[self.selected];
+        match chat.pane.as_mut() {
+            Some(pane) if pane.is_alive() => {
+                let application_cursor = pane.with_screen(|s| s.application_cursor());
+                pane.write(&keys::encode_key(key, application_cursor));
+            }
+            // A finished program is relaunched fresh with Enter.
+            Some(_) if key.code == KeyCode::Enter => self.restart_native(self.selected, false),
+            _ => {}
+        }
+    }
+
+    /// Writes raw bytes to the selected embedded terminal, if it is running.
+    fn write_to_selected_pane(&mut self, bytes: &[u8]) {
+        if let Some(pane) = self.chats[self.selected]
+            .pane
+            .as_mut()
+            .filter(|p| p.is_alive())
+        {
+            pane.write(bytes);
+        }
+    }
+
+    /// Kills the tab's terminal program so the next frame relaunches it, optionally in resume mode.
+    fn restart_native(&mut self, index: usize, resume: bool) {
+        let chat = &mut self.chats[index];
+        chat.pane = None;
+        chat.launch_attempted = false;
+        chat.resume_next = resume;
+        chat.entries.clear();
+    }
+
+    /// Keeps embedded terminals in step with the screen: launches the selected one on first view,
+    /// resizes it to `area`, and refreshes every native tab's status dot. Called before each draw.
+    pub fn sync_terminal(&mut self, area: Rect) {
+        self.terminal_area = area;
+        for index in 0..self.chats.len() {
+            if !self.chats[index].native {
+                continue;
+            }
+            if index == self.selected {
+                if self.chats[index].pane.is_none() && !self.chats[index].launch_attempted {
+                    self.launch_native(index, area);
+                }
+                if let Some(pane) = self.chats[index].pane.as_mut() {
+                    pane.resize(area.height, area.width);
+                }
+            }
+            let chat = &mut self.chats[index];
+            chat.status = match &chat.pane {
+                Some(pane) if pane.is_alive() => Status::Idle,
+                _ => Status::Offline,
+            };
+        }
+    }
+
+    /// Starts tab `index`'s real CLI at the size of `area`, recording a launch error in the transcript.
+    fn launch_native(&mut self, index: usize, area: Rect) {
+        let name = self.chats[index].name.clone();
+        let resume = self.chats[index].resume_next;
+        let env = &self.env;
+        let bridge = Bridge {
+            exe: &env.exe,
+            config_path: &env.config.path,
+            a2a_url: &env.a2a_url,
+            token: &env.token,
+            image_agent: env.config.image_agent(),
+        };
+        let launched = terminal_agents::launch(&name, &bridge, resume)
+            .ok_or_else(|| anyhow::anyhow!("{name} has no native CLI"))
+            .and_then(|launch| PtyPane::spawn(&launch, &env.cwd, area.height, area.width));
+        let chat = &mut self.chats[index];
+        chat.launch_attempted = true;
+        chat.resume_next = false;
+        match launched {
+            Ok(pane) => chat.pane = Some(pane),
+            Err(error) => chat.entries.push(Entry {
+                role: Role::Error,
+                text: format!("{error:#}"),
+            }),
+        }
+    }
+
+    /// Cursor index one word to the left of the cursor, skipping spaces first.
+    fn word_left(&self) -> usize {
+        let mut index = self.cursor;
+        while index > 0 && self.input[index - 1].is_whitespace() {
+            index -= 1;
+        }
+        while index > 0 && !self.input[index - 1].is_whitespace() {
+            index -= 1;
+        }
+        index
+    }
+
+    /// Cursor index at the end of the next word to the right, skipping spaces first.
+    fn word_right(&self) -> usize {
+        let mut index = self.cursor;
+        while index < self.input.len() && self.input[index].is_whitespace() {
+            index += 1;
+        }
+        while index < self.input.len() && !self.input[index].is_whitespace() {
+            index += 1;
+        }
+        index
     }
 
     /// Executes a click action.
@@ -316,7 +568,11 @@ impl App {
             return false;
         };
         self.selected = index;
-        self.send(index, Command::ListSessions);
+        if self.chats[index].native {
+            self.restart_native(index, true);
+        } else {
+            self.send(index, Command::ListSessions);
+        }
         true
     }
 
@@ -447,18 +703,30 @@ mod tests {
     use ratatui::crossterm::event::{KeyEventKind, KeyEventState};
     use std::sync::mpsc;
 
-    /// An app with no agents configured, plus the receiver for its UI events.
+    /// An app with the chat-only agent `local` selected, plus the receiver for its UI events.
     fn app() -> (App, mpsc::Receiver<UiEvent>) {
         let (ui, events) = mpsc::channel();
         let env = Env {
-            config: Arc::new(Config::default()),
+            config: Arc::new(
+                serde_json::from_str::<Config>(
+                    r#"{"agents": {"local": {"kind": "ollama", "model": "m"}}}"#,
+                )
+                .unwrap(),
+            ),
             exe: PathBuf::from("central"),
             cwd: PathBuf::from("."),
             a2a_url: "http://127.0.0.1:1".into(),
             token: "t".into(),
             ui,
         };
-        (App::new(env, Arc::new(AtomicBool::new(false))), events)
+        let mut app = App::new(env, Arc::new(AtomicBool::new(false)));
+        // Select the chat-only custom agent; built-in agents are embedded terminals.
+        app.selected = app
+            .chats
+            .iter()
+            .position(|chat| chat.name == "local")
+            .unwrap();
+        (app, events)
     }
 
     /// A key-press event with no modifiers.
@@ -546,7 +814,7 @@ mod tests {
     #[test]
     fn streamed_text_accumulates() {
         let (mut app, _events) = app();
-        let agent = app.chats[0].name.clone();
+        let agent = app.chats[app.selected].name.clone();
         for event in [
             AgentEvent::Text("he".into()),
             AgentEvent::Text("llo".into()),
@@ -557,7 +825,7 @@ mod tests {
                 event,
             });
         }
-        let entries = &app.chats[0].entries;
+        let entries = &app.chats[app.selected].entries;
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].text, "hello");
     }
@@ -566,14 +834,14 @@ mod tests {
     #[test]
     fn failure_resets_worker() {
         let (mut app, _events) = app();
-        let agent = app.chats[0].name.clone();
-        app.chats[0].worker = Some(mpsc::channel().0);
+        let agent = app.chats[app.selected].name.clone();
+        app.chats[app.selected].worker = Some(mpsc::channel().0);
         app.apply(UiEvent::Agent {
             agent,
             event: AgentEvent::Failed("boom".into()),
         });
-        assert!(app.chats[0].worker.is_none());
-        assert_eq!(app.chats[0].status, Status::Offline);
+        assert!(app.chats[app.selected].worker.is_none());
+        assert_eq!(app.chats[app.selected].status, Status::Offline);
     }
 
     // Sending a message records it and marks the tab busy.
@@ -581,13 +849,87 @@ mod tests {
     fn submit_sends_to_worker() {
         let (mut app, _events) = app();
         let (worker, inbox) = mpsc::channel();
-        app.chats[0].worker = Some(worker);
+        app.chats[app.selected].worker = Some(worker);
         for c in "hi ".chars() {
             app.key(press(KeyCode::Char(c)));
         }
         app.key(press(KeyCode::Enter));
         assert!(matches!(inbox.recv().unwrap(), Command::Prompt(text) if text == "hi"));
-        assert_eq!(app.chats[0].status, Status::Busy);
+        assert_eq!(app.chats[app.selected].status, Status::Busy);
         assert!(app.input.is_empty());
+    }
+
+    /// A pane running `sh -c script` on a 10x40 terminal.
+    fn shell_pane(script: &str) -> PtyPane {
+        let launch = crate::config::Launch {
+            program: "sh".to_owned(),
+            args: vec!["-c".to_owned(), script.to_owned()],
+            env: Default::default(),
+        };
+        PtyPane::spawn(&launch, std::path::Path::new("."), 10, 40).unwrap()
+    }
+
+    /// Key press with modifiers.
+    fn press_with(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            modifiers,
+            ..press(code)
+        }
+    }
+
+    // Option+Left/Right (and the ESC b / ESC f form) move the message-box cursor by whole words.
+    #[test]
+    fn alt_arrows_move_by_words() {
+        let (mut app, _events) = app();
+        for c in "one two  three".chars() {
+            app.key(press(KeyCode::Char(c)));
+        }
+        app.key(press_with(KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(app.cursor, 9);
+        app.key(press_with(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(app.cursor, 4);
+        app.key(press_with(KeyCode::Right, KeyModifiers::ALT));
+        assert_eq!(app.cursor, 7);
+        app.key(press_with(KeyCode::Char('f'), KeyModifiers::ALT));
+        assert_eq!(app.cursor, 14);
+    }
+
+    // In an embedded terminal Ctrl+C is the program's, and the Ctrl+] chord drives the app instead.
+    #[test]
+    fn chord_controls_app_but_ctrl_c_is_not_quit() {
+        let (mut app, _events) = app();
+        app.selected = app.chats.iter().position(|chat| chat.native).unwrap();
+        let start = app.selected;
+        app.key(press_with(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.quit);
+        app.key(press_with(KeyCode::Char(']'), KeyModifiers::CONTROL));
+        assert!(app.prefix_pending);
+        app.key(press(KeyCode::Char('n')));
+        assert_eq!(app.selected, (start + 1) % app.chats.len());
+        app.selected = start;
+        // The form a real terminal delivers for byte 0x1d.
+        app.key(press_with(KeyCode::Char('5'), KeyModifiers::CONTROL));
+        app.key(press(KeyCode::Char('q')));
+        assert!(app.quit);
+    }
+
+    // Keystrokes in a native tab are written to the program's pty, and pastes arrive intact.
+    #[test]
+    fn native_tab_forwards_keys_to_the_pty() {
+        let (mut app, _events) = app();
+        app.selected = app.chats.iter().position(|chat| chat.native).unwrap();
+        app.chats[app.selected].pane = Some(shell_pane("read line; echo got:$line"));
+        app.paste("hi");
+        app.key(press(KeyCode::Char('!')));
+        app.key(press(KeyCode::Enter));
+        let pane = app.chats[app.selected].pane.as_ref().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !pane.with_screen(|s| s.contents().contains("got:hi!")) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "program never saw the input"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }
