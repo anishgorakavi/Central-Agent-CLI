@@ -106,6 +106,7 @@ fn tool_definitions() -> Value {
                     "agent": {"type": "string", "description": "Agent name, see `central agents`."},
                     "prompt": {"type": "string"},
                     "cwd": {"type": "string", "description": "Working directory for the agent; defaults to the current one."},
+                    "model": {"type": "string", "description": "Model the agent should run instead of its default (claude, codex, ollama and custom agents)."},
                 },
                 "required": ["agent", "prompt"],
             },
@@ -141,7 +142,7 @@ fn generate_image(target: &Target, image_agent: &str, args: &Value) -> Result<St
          Save the resulting file inside {} and reply with its absolute path.",
         image_dir.display()
     );
-    forward(target, image_agent, &prompt, &cwd, &image_dir)
+    forward(target, image_agent, &prompt, &cwd, &image_dir, None)
 }
 
 /// Handles `delegate`: forwards a prompt to any named agent.
@@ -157,6 +158,7 @@ fn delegate(target: &Target, args: &Value) -> Result<String> {
         required_str(args, "prompt")?,
         &cwd,
         &image_dir,
+        args["model"].as_str(),
     )
 }
 
@@ -167,8 +169,9 @@ fn forward(
     prompt: &str,
     cwd: &Path,
     image_dir: &Path,
+    model: Option<&str>,
 ) -> Result<String> {
-    let reply = a2a::send_message(target, agent, prompt, cwd, image_dir)?;
+    let reply = a2a::send_message(target, agent, prompt, cwd, image_dir, model)?;
     let mut report = reply.text;
     for path in &reply.images {
         report.push_str(&format!("\nSaved image: {}", path.display()));

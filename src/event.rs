@@ -18,6 +18,15 @@ pub struct PermissionRequest {
     pub reply: Sender<Option<String>>,
 }
 
+/// One step of a delegated task, shown in the target agent's tab so its work is visible there.
+pub enum DelegationStep {
+    Start(String),
+    Text(String),
+    Tool(String),
+    Done,
+    Failed(String),
+}
+
 /// Everything the TUI event loop receives from other threads.
 pub enum UiEvent {
     Agent {
@@ -27,6 +36,12 @@ pub enum UiEvent {
     /// A line for the A2A activity pane.
     Activity(String),
     Permission(PermissionRequest),
+    /// Progress of a task another agent delegated to `agent`.
+    Delegation {
+        agent: String,
+        caller: String,
+        step: DelegationStep,
+    },
 }
 
 /// Builds the permission policy for `agent`: auto-approve while the flag is set, otherwise ask the

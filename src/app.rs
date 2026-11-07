@@ -1,7 +1,7 @@
 //! TUI state and input handling: agent tabs, transcripts, the message box, permission prompts and click targets.
 use crate::acp_client::{AgentEvent, SessionInfo};
 use crate::config::Config;
-use crate::event::{PermissionRequest, UiEvent, decider};
+use crate::event::{DelegationStep, PermissionRequest, UiEvent, decider};
 use crate::keys;
 use crate::mcp_server;
 use crate::pty_pane::PtyPane;
@@ -65,6 +65,15 @@ pub struct Chat {
     pub launch_attempted: bool,
     /// Start the CLI in its resume mode on the next launch.
     pub resume_next: bool,
+    /// The latest task another agent delegated here, shown over the CLI until dismissed.
+    pub delegation: Option<Delegation>,
+}
+
+/// A task delegated to a tab's agent over A2A, with the work it has streamed so far.
+pub struct Delegation {
+    pub caller: String,
+    pub text: String,
+    pub running: bool,
 }
 
 /// What clicking a screen region does.
@@ -131,6 +140,7 @@ impl App {
                 pane: None,
                 launch_attempted: false,
                 resume_next: false,
+                delegation: None,
             })
             .collect();
         App {
@@ -165,6 +175,15 @@ impl App {
                 }
             }
             UiEvent::Permission(request) => self.permissions.push_back(request),
+            UiEvent::Delegation {
+                agent,
+                caller,
+                step,
+            } => {
+                if let Some(chat) = self.chats.iter_mut().find(|chat| chat.name == agent) {
+                    chat.apply_delegation(caller, step);
+                }
+            }
             UiEvent::Agent { agent, event } => {
                 let Some(index) = self.chats.iter().position(|chat| chat.name == agent) else {
                     return;
@@ -354,13 +373,18 @@ impl App {
 
     /// Handles a key while an embedded terminal is selected: Ctrl+] starts a chord, everything else
     /// goes to the program. After the chord key: n/p or Tab/Shift+Tab switch tab, 1-9 pick a tab,
-    /// a toggles auto-approve, r restarts in resume mode, q quits, and Ctrl+] again sends a literal Ctrl+].
+    /// a toggles auto-approve, r restarts in resume mode, d dismisses the delegated-task panel, q quits, and Ctrl+] again sends a literal Ctrl+].
     fn native_key(&mut self, key: KeyEvent) {
         // Terminals send Ctrl+] as byte 0x1d, which crossterm reports as Ctrl+5.
         let is_prefix = matches!(key.code, KeyCode::Char(PREFIX_KEY | '5'))
             && key.modifiers.contains(KeyModifiers::CONTROL);
         if self.prefix_pending {
             self.prefix_pending = false;
+            // Checked before the digit arm: crossterm reports Ctrl+] as Char('5') with CONTROL.
+            if is_prefix {
+                self.write_to_selected_pane(&[PREFIX_BYTE]);
+                return;
+            }
             let count = self.chats.len();
             match key.code {
                 KeyCode::Char('n') | KeyCode::Tab => self.selected = (self.selected + 1) % count,
@@ -375,8 +399,8 @@ impl App {
                 }
                 KeyCode::Char('a') => self.perform(Action::ToggleAutoApprove),
                 KeyCode::Char('r') => self.restart_native(self.selected, true),
+                KeyCode::Char('d') => self.chats[self.selected].delegation = None,
                 KeyCode::Char('q') => self.quit = true,
-                _ if is_prefix => self.write_to_selected_pane(&[PREFIX_BYTE]),
                 _ => {}
             }
             return;
@@ -645,6 +669,31 @@ impl App {
 }
 
 impl Chat {
+    /// Records progress of a task delegated to this agent; a new task replaces the previous panel.
+    fn apply_delegation(&mut self, caller: String, step: DelegationStep) {
+        if let DelegationStep::Start(prompt) = step {
+            self.delegation = Some(Delegation {
+                caller,
+                text: format!("Task: {prompt}\n\n"),
+                running: true,
+            });
+            return;
+        }
+        let Some(delegation) = self.delegation.as_mut() else {
+            return;
+        };
+        match step {
+            DelegationStep::Text(text) => delegation.text.push_str(&text),
+            DelegationStep::Tool(title) => delegation.text.push_str(&format!("\n> {title}\n")),
+            DelegationStep::Failed(error) => {
+                delegation.text.push_str(&format!("\nfailed: {error}\n"));
+                delegation.running = false;
+            }
+            DelegationStep::Done => delegation.running = false,
+            DelegationStep::Start(_) => {}
+        }
+    }
+
     /// Updates the transcript and status from an agent event.
     fn apply(&mut self, event: AgentEvent) {
         match event {
@@ -931,5 +980,49 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    // Ctrl+] then Ctrl+] sends one literal Ctrl+] to the program instead of selecting tab 5.
+    #[test]
+    fn double_prefix_sends_literal_ctrl_bracket() {
+        let (mut app, _events) = app();
+        app.selected = app.chats.iter().position(|chat| chat.native).unwrap();
+        app.chats[app.selected].pane = Some(shell_pane("stty raw -echo; cat -v"));
+        let start = app.selected;
+        app.key(press_with(KeyCode::Char('5'), KeyModifiers::CONTROL));
+        app.key(press_with(KeyCode::Char('5'), KeyModifiers::CONTROL));
+        assert!(!app.prefix_pending);
+        assert_eq!(app.selected, start);
+        let pane = app.chats[app.selected].pane.as_ref().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !pane.with_screen(|s| s.contents().contains("^]")) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "program never saw the literal Ctrl+]"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    // Delegated work streams into the target tab's panel, and a new task replaces the old one.
+    #[test]
+    fn delegation_steps_fill_the_panel() {
+        let (mut app, _events) = app();
+        let send = |app: &mut App, step| {
+            app.apply(UiEvent::Delegation {
+                agent: "codex".into(),
+                caller: "claude".into(),
+                step,
+            })
+        };
+        send(&mut app, DelegationStep::Start("fix it".into()));
+        send(&mut app, DelegationStep::Tool("cargo test".into()));
+        send(&mut app, DelegationStep::Text("done".into()));
+        let codex = app.chats.iter().find(|c| c.name == "codex").unwrap();
+        let panel = codex.delegation.as_ref().unwrap();
+        assert!(panel.running && panel.text.contains("cargo test") && panel.text.ends_with("done"));
+        send(&mut app, DelegationStep::Done);
+        let codex = app.chats.iter().find(|c| c.name == "codex").unwrap();
+        assert!(!codex.delegation.as_ref().unwrap().running);
     }
 }

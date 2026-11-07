@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 const DEFAULT_OPENAI_URL: &str = "https://api.openai.com/v1";
+const CLAUDE_DELEGATE_MODEL: &str = "claude-sonnet-5-5";
+const DEFAULT_OLLAMA_MODEL: &str = "llama3.2";
 const DEFAULT_IMAGE_AGENT: &str = "codex";
 
 /// How to reach one agent: an external ACP process, or a custom harness around an LLM endpoint.
@@ -53,6 +55,29 @@ pub struct Launch {
 }
 
 impl AgentSpec {
+    /// Returns a copy of this spec that runs `model` instead of its configured one.
+    /// Custom LLM agents swap their model; the Claude and Codex adapters take it through their
+    /// environment / `-c` flag. Other ACP agents have no known model switch, so they are rejected.
+    pub fn with_model(&self, agent: &str, model: &str) -> Result<AgentSpec> {
+        let mut spec = self.clone();
+        match (&mut spec, agent) {
+            (
+                AgentSpec::Ollama { model: current, .. } | AgentSpec::Openai { model: current, .. },
+                _,
+            ) => {
+                *current = model.to_owned();
+            }
+            (AgentSpec::Acp { env, .. }, "claude") => {
+                env.insert("ANTHROPIC_MODEL".to_owned(), model.to_owned());
+            }
+            (AgentSpec::Acp { args, .. }, "codex") => {
+                args.extend(["-c".to_owned(), format!("model=\"{model}\"")]);
+            }
+            _ => bail!("agent '{agent}' does not support choosing a model"),
+        }
+        Ok(spec)
+    }
+
     /// Resolves this spec to a spawnable command. Custom agents re-invoke this binary
     /// (`serve <name>`) so they look like any other ACP agent to the client.
     pub fn launch(&self, name: &str, exe: &Path, config_path: &Path) -> Launch {
@@ -76,22 +101,40 @@ impl AgentSpec {
     }
 }
 
-/// Built-in ACP agents, installed from their upstream adapters on first use.
+/// Built-in agents: ACP adapters installed from upstream on first use, and the Ollama harness.
 fn builtin(name: &str) -> Option<AgentSpec> {
+    if name == "ollama" {
+        // OLLAMA_MODEL lets users pick the tab's model without a config file; delegations can override it.
+        return Some(AgentSpec::Ollama {
+            model: std::env::var("OLLAMA_MODEL")
+                .unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_owned()),
+            base_url: default_ollama_url(),
+            system: None,
+        });
+    }
     let (command, args): (&str, &[&str]) = match name {
         "claude" => ("npx", &["-y", "@agentclientprotocol/claude-agent-acp"]),
         "codex" => ("npx", &["-y", "@agentclientprotocol/codex-acp"]),
         "antigravity" | "agy" => ("agy", &["acp"]),
         _ => return None,
     };
+    // The Claude adapter otherwise falls back to a small default model; delegated work should run on
+    // Sonnet unless the user already pinned a model in their environment.
+    let mut env = BTreeMap::new();
+    if name == "claude" && std::env::var_os("ANTHROPIC_MODEL").is_none() {
+        env.insert(
+            "ANTHROPIC_MODEL".to_owned(),
+            CLAUDE_DELEGATE_MODEL.to_owned(),
+        );
+    }
     Some(AgentSpec::Acp {
         command: command.to_owned(),
         args: args.iter().map(|arg| (*arg).to_owned()).collect(),
-        env: BTreeMap::new(),
+        env,
     })
 }
 
-const BUILTIN_NAMES: [&str; 3] = ["claude", "codex", "antigravity"];
+const BUILTIN_NAMES: [&str; 4] = ["claude", "codex", "antigravity", "ollama"];
 
 /// User configuration: custom agents (which may also shadow built-ins) and the image agent choice.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -192,6 +235,39 @@ mod tests {
         };
         config.agents.insert("codex".into(), override_spec.clone());
         assert_eq!(config.resolve("codex").unwrap(), override_spec);
+    }
+
+    // Model overrides land where each kind reads its model, and unsupported agents fail loudly.
+    #[test]
+    fn with_model_overrides_per_agent_kind() {
+        let config = Config::default();
+        let claude = config
+            .resolve("claude")
+            .unwrap()
+            .with_model("claude", "m1")
+            .unwrap();
+        assert!(matches!(&claude, AgentSpec::Acp { env, .. } if env["ANTHROPIC_MODEL"] == "m1"));
+        let codex = config
+            .resolve("codex")
+            .unwrap()
+            .with_model("codex", "m2")
+            .unwrap();
+        assert!(
+            matches!(&codex, AgentSpec::Acp { args, .. } if args.ends_with(&["-c".into(), "model=\"m2\"".into()]))
+        );
+        let ollama = config
+            .resolve("ollama")
+            .unwrap()
+            .with_model("ollama", "qwen")
+            .unwrap();
+        assert!(matches!(&ollama, AgentSpec::Ollama { model, .. } if model == "qwen"));
+        assert!(
+            config
+                .resolve("antigravity")
+                .unwrap()
+                .with_model("antigravity", "x")
+                .is_err()
+        );
     }
 
     // Custom agents launch this binary with the config path so the child sees the same registry.

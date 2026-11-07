@@ -1,5 +1,5 @@
 //! TUI rendering: sidebar, the embedded real-CLI terminal or chat transcript, activity pane, message box, status bar and dialogs.
-use crate::app::{Action, App, Entry, Role, Status};
+use crate::app::{Action, App, Delegation, Entry, Role, Status};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -16,8 +16,7 @@ const MAX_PICKER_ROWS: usize = 15;
 // Activity line and status bar under an embedded terminal.
 const NATIVE_FOOTER_ROWS: u16 = 2;
 const CHAT_HINTS: &str = " click agent/switch | Tab: next agent | wheel/PgUp/PgDn: scroll | Alt+Left/Right: word | Ctrl+C: quit";
-const NATIVE_HINTS: &str =
-    " Ctrl+] then: n/p switch agent | 1-9 pick | a auto-approve | r resume | q quit";
+const NATIVE_HINTS: &str = " Ctrl+] then: n/p switch agent | 1-9 pick | a auto-approve | r resume | d dismiss task | q quit";
 const PREFIX_PENDING_HINTS: &str =
     " Ctrl+] ... press n/p (switch), 1-9, a (auto-approve), r (resume), q (quit), Esc to cancel";
 
@@ -131,6 +130,9 @@ fn draw_terminal(frame: &mut Frame, app: &App, area: Rect) {
     if let (true, Some(position)) = (show_cursor, cursor) {
         frame.set_cursor_position(position);
     }
+    if let Some(delegation) = &chat.delegation {
+        draw_delegation(frame, delegation, area);
+    }
     if !pane.is_alive() {
         draw_exited_banner(frame, area, &chat.name);
     }
@@ -183,6 +185,27 @@ fn convert_color(color: vt100::Color) -> Color {
 }
 
 /// One-line notice over the bottom of the terminal telling how to relaunch a finished program.
+/// Overlays the lower half of the terminal with the delegated task's live output, tail-first.
+fn draw_delegation(frame: &mut Frame, delegation: &Delegation, area: Rect) {
+    let height = (area.height / 2).max(5).min(area.height);
+    let panel = Rect::new(area.x, area.bottom() - height, area.width, height);
+    let state = if delegation.running {
+        "working"
+    } else {
+        "finished - Ctrl+] d to dismiss"
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(format!(" delegated by {} ({state}) ", delegation.caller));
+    let inner = block.inner(panel);
+    let rows = wrap(&delegation.text, inner.width as usize);
+    let skip = rows.len().saturating_sub(inner.height as usize);
+    let lines: Vec<Line> = rows.into_iter().skip(skip).map(Line::from).collect();
+    frame.render_widget(Clear, panel);
+    frame.render_widget(Paragraph::new(lines).block(block), panel);
+}
+
 fn draw_exited_banner(frame: &mut Frame, area: Rect, name: &str) {
     let banner = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
     let text =

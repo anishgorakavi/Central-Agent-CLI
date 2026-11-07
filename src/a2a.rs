@@ -1,7 +1,7 @@
 //! A2A (Agent2Agent) v1.0, JSON-RPC binding: an HTTP server exposing every agent, and the client the MCP bridge uses.
 use crate::acp_client::{AgentEvent, Client};
 use crate::config::Config;
-use crate::event::{UiEvent, decider};
+use crate::event::{DelegationStep, UiEvent, decider};
 use crate::rpc;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -188,6 +188,8 @@ struct TaskRequest {
     cwd: PathBuf,
     output_dir: PathBuf,
     caller: String,
+    /// Model the caller wants the agent to run instead of its default.
+    model: Option<String>,
 }
 
 impl TaskRequest {
@@ -219,6 +221,7 @@ impl TaskRequest {
             cwd,
             output_dir,
             caller: metadata["caller"].as_str().unwrap_or("unknown").to_owned(),
+            model: metadata["model"].as_str().map(str::to_owned),
         })
     }
 }
@@ -262,27 +265,67 @@ fn run_task(state: &State, agent: &str, request: &TaskRequest) -> Value {
 /// and converts the reply into A2A parts: one text part plus one raw part per generated image.
 fn execute(state: &State, agent: &str, request: &TaskRequest) -> Result<Vec<Value>> {
     let exe = std::env::current_exe()?;
-    let launch = state
-        .config
-        .resolve(agent)?
-        .launch(agent, &exe, &state.config.path);
+    let mut spec = state.config.resolve(agent)?;
+    if let Some(model) = &request.model {
+        spec = spec.with_model(agent, model)?;
+    }
+    let launch = spec.launch(agent, &exe, &state.config.path);
     let decide = decider(agent, state.ui.clone(), state.auto_allow.clone());
     let progress_ui = state.ui.clone();
     let progress_agent = agent.to_owned();
-    let on_event = Box::new(move |event| {
-        if let (AgentEvent::Tool(title), Some(ui)) = (event, &progress_ui) {
-            let _ = ui.send(UiEvent::Activity(format!("{progress_agent} tool: {title}")));
+    let send_step = {
+        let (ui, agent, caller) = (
+            progress_ui.clone(),
+            progress_agent.clone(),
+            request.caller.clone(),
+        );
+        move |step| {
+            if let Some(ui) = &ui {
+                let _ = ui.send(UiEvent::Delegation {
+                    agent: agent.clone(),
+                    caller: caller.clone(),
+                    step,
+                });
+            }
         }
+    };
+    let report = send_step.clone();
+    let on_event = Box::new(move |event| match event {
+        AgentEvent::Tool(title) => {
+            if let Some(ui) = &progress_ui {
+                let _ = ui.send(UiEvent::Activity(format!("{progress_agent} tool: {title}")));
+            }
+            report(DelegationStep::Tool(title));
+        }
+        AgentEvent::Text(text) => report(DelegationStep::Text(text)),
+        _ => {}
     });
-    let mut client = Client::start(
+    send_step(DelegationStep::Start(request.prompt.clone()));
+    let finish = |result: Result<(), String>| {
+        send_step(match result {
+            Ok(()) => DelegationStep::Done,
+            Err(error) => DelegationStep::Failed(error),
+        });
+    };
+    let outcome = Client::start(
         &launch,
         &request.cwd,
         vec![],
         decide,
         request.output_dir.clone(),
         on_event,
-    )?;
-    let outcome = client.prompt(&request.prompt)?;
+    )
+    .and_then(|mut client| client.prompt(&request.prompt));
+    let outcome = match outcome {
+        Ok(outcome) => {
+            finish(Ok(()));
+            outcome
+        }
+        Err(error) => {
+            finish(Err(format!("{error:#}")));
+            return Err(error);
+        }
+    };
 
     let mut parts = vec![json!({"text": outcome.text})];
     for path in &outcome.images {
@@ -354,19 +397,21 @@ pub struct Reply {
 }
 
 /// Sends `text` to `agent` through the A2A server (blocking SendMessage) and saves returned files into `output_dir`.
+/// `model` asks the agent to run that model instead of its default.
 pub fn send_message(
     target: &Target,
     agent: &str,
     text: &str,
     cwd: &Path,
     output_dir: &Path,
+    model: Option<&str>,
 ) -> Result<Reply> {
     let url = format!("{}/agents/{agent}", target.base_url);
     let message = json!({
         "messageId": format!("msg-{}", std::process::id()),
         "role": "ROLE_USER",
         "parts": [{"text": text}],
-        "metadata": {"cwd": cwd, "outputDir": output_dir, "caller": target.caller},
+        "metadata": {"cwd": cwd, "outputDir": output_dir, "caller": target.caller, "model": model},
     });
     let call = rpc::request(1, "SendMessage", json!({"message": message}));
     let http = ureq::AgentBuilder::new().timeout_read(CALL_TIMEOUT).build();
@@ -477,6 +522,11 @@ mod tests {
     fn task_request_requires_cwd_and_text() {
         let ok = json!({"message": {"parts": [{"text": "hi"}], "metadata": {"cwd": "/w"}}});
         assert!(TaskRequest::parse(&ok).is_ok());
+        let with_model = json!({"message": {"parts": [{"text": "hi"}], "metadata": {"cwd": "/w", "model": "m"}}});
+        assert_eq!(
+            TaskRequest::parse(&with_model).unwrap().model.as_deref(),
+            Some("m")
+        );
         assert!(TaskRequest::parse(&json!({"message": {"parts": [{"text": "hi"}]}})).is_err());
         assert!(
             TaskRequest::parse(&json!({"message": {"parts": [], "metadata": {"cwd": "/w"}}}))
