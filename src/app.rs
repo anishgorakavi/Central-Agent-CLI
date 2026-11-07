@@ -1,8 +1,9 @@
 //! TUI state and input handling: agent tabs, transcripts, the message box, permission prompts and click targets.
 use crate::acp_client::{AgentEvent, SessionInfo};
-use crate::config::Config;
+use crate::config::{AgentSpec, Config};
 use crate::event::{DelegationStep, PermissionRequest, UiEvent, decider};
 use crate::keys;
+use crate::llm;
 use crate::mcp_server;
 use crate::pty_pane::PtyPane;
 use crate::terminal_agents::{self, Bridge};
@@ -11,7 +12,7 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -116,6 +117,8 @@ pub struct App {
     /// Click targets recorded by the last draw, in paint order (topmost last).
     pub hitboxes: Vec<(Rect, Action)>,
     pub quit: bool,
+    /// Models picked with `/model`, by agent name; they outlast the agent's worker.
+    model_overrides: HashMap<String, String>,
     /// Screen area of the embedded terminal, recorded by the event loop before each draw.
     pub terminal_area: Rect,
     /// True after Ctrl+] while the next key is a chord command.
@@ -154,10 +157,20 @@ impl App {
             auto_allow,
             hitboxes: Vec::new(),
             quit: false,
+            model_overrides: HashMap::new(),
             terminal_area: Rect::default(),
             prefix_pending: false,
             env,
         }
+    }
+
+    /// The model the `index`-th tab's agent runs: the `/model` choice, else the configured one.
+    pub fn model_label(&self, index: usize) -> Option<String> {
+        let name = &self.chats[index].name;
+        self.model_overrides.get(name).cloned().or_else(|| {
+            let spec = self.env.config.resolve(name).ok()?;
+            spec.model().map(str::to_owned)
+        })
     }
 
     /// The tab currently shown.
@@ -555,7 +568,7 @@ impl App {
         }
     }
 
-    /// Handles the message box on Enter: `/resume` and `/new` are commands, anything else is a prompt.
+    /// Handles the message box on Enter: `/resume`, `/new` and `/model` are commands, anything else is a prompt.
     fn submit(&mut self) {
         let text: String = self.input.iter().collect::<String>().trim().to_owned();
         if text.is_empty() {
@@ -571,9 +584,12 @@ impl App {
                 self.chats[index].entries.clear();
                 self.send(index, Command::NewSession);
             }
+            command if command == "/model" || command.starts_with("/model ") => {
+                self.model_command(index, command["/model".len()..].trim());
+            }
             command if command.starts_with('/') => self.chats[index].entries.push(Entry {
                 role: Role::Error,
-                text: format!("unknown command {command} (try /resume or /new)"),
+                text: format!("unknown command {command} (try /resume, /new or /model)"),
             }),
             _ => {
                 self.chats[index].entries.push(Entry {
@@ -583,6 +599,42 @@ impl App {
                 self.send(index, Command::Prompt(text));
             }
         }
+    }
+
+    /// `/model` lists the installed Ollama models and the current one; `/model <name>` restarts the
+    /// tab's agent on that model with a fresh conversation, since history does not carry across models.
+    fn model_command(&mut self, index: usize, requested: &str) {
+        let name = self.chats[index].name.clone();
+        let spec = self.env.config.resolve(&name);
+        let notice = |app: &mut App, role, text: String| {
+            app.chats[index].entries.push(Entry { role, text });
+        };
+        let Some(current) = self.model_label(index) else {
+            let text = format!("{name} does not support choosing a model here");
+            return notice(self, Role::Error, text);
+        };
+        if requested.is_empty() {
+            let mut text = format!("model: {current}");
+            if let Ok(AgentSpec::Ollama { base_url, .. }) = &spec {
+                match llm::ollama_models(base_url) {
+                    Ok(models) => text.push_str(&format!("\ninstalled: {}", models.join(", "))),
+                    Err(error) => text.push_str(&format!("\ncannot list models: {error:#}")),
+                }
+            }
+            text.push_str("\nswitch with /model <name>");
+            return notice(self, Role::Tool, text);
+        }
+        self.model_overrides.insert(name, requested.to_owned());
+        // Dropping the worker's sender stops its thread; the next message starts one on the new model.
+        let chat = &mut self.chats[index];
+        chat.worker = None;
+        chat.status = Status::Offline;
+        chat.entries.clear();
+        notice(
+            self,
+            Role::Tool,
+            format!("model set to {requested}; the next message starts a fresh session"),
+        );
     }
 
     /// Selects the tab named `agent` and opens its `/resume` list, as `central --resume <agent>` does.
@@ -634,16 +686,23 @@ impl App {
         }
         let name = self.chats[index].name.clone();
         let env = &self.env;
-        let spec = match env.config.resolve(&name) {
-            Ok(spec) => spec,
-            Err(error) => {
-                self.chats[index].entries.push(Entry {
-                    role: Role::Error,
-                    text: format!("{error:#}"),
-                });
-                return;
-            }
-        };
+        let spec =
+            match env
+                .config
+                .resolve(&name)
+                .and_then(|spec| match self.model_overrides.get(&name) {
+                    Some(model) => spec.with_model(&name, model),
+                    None => Ok(spec),
+                }) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    self.chats[index].entries.push(Entry {
+                        role: Role::Error,
+                        text: format!("{error:#}"),
+                    });
+                    return;
+                }
+            };
         let launch = spec.launch(&name, &env.exe, &env.config.path);
         let bridge = mcp_server::session_entry(
             &env.exe,
@@ -906,6 +965,20 @@ mod tests {
         assert!(matches!(inbox.recv().unwrap(), Command::Prompt(text) if text == "hi"));
         assert_eq!(app.chats[app.selected].status, Status::Busy);
         assert!(app.input.is_empty());
+    }
+
+    // /model <name> stops the worker, clears the transcript and shows the new model in the title.
+    #[test]
+    fn model_command_switches_model_and_resets_tab() {
+        let (mut app, _events) = app();
+        let (worker, _inbox) = mpsc::channel();
+        let index = app.selected;
+        app.chats[index].worker = Some(worker);
+        app.input = "/model qwen3".chars().collect();
+        app.submit();
+        assert!(app.chats[index].worker.is_none());
+        assert_eq!(app.model_label(index).as_deref(), Some("qwen3"));
+        assert!(app.chats[index].entries[0].text.contains("qwen3"));
     }
 
     /// A pane running `sh -c script` on a 10x40 terminal.

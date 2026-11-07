@@ -145,6 +145,7 @@ impl Drop for PtyPane {
     /// Stops the child so no orphan process outlives its tab. portable-pty's own kill sends SIGHUP,
     /// which Claude Code survives, so the child is SIGKILLed to keep quitting instantaneous.
     fn drop(&mut self) {
+        #[cfg(unix)]
         if let Some(pid) = self.child.process_id() {
             // SAFETY: plain kill(2) on the child pid we spawned; no memory is touched.
             unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };

@@ -55,6 +55,14 @@ pub struct Launch {
 }
 
 impl AgentSpec {
+    /// The model a custom LLM agent runs; None for ACP agents, which choose their own.
+    pub fn model(&self) -> Option<&str> {
+        match self {
+            AgentSpec::Ollama { model, .. } | AgentSpec::Openai { model, .. } => Some(model),
+            AgentSpec::Acp { .. } => None,
+        }
+    }
+
     /// Returns a copy of this spec that runs `model` instead of its configured one.
     /// Custom LLM agents swap their model; the Claude and Codex adapters take it through their
     /// environment / `-c` flag. Other ACP agents have no known model switch, so they are rejected.
@@ -154,7 +162,10 @@ impl Config {
         let path = match path {
             Some(path) => path,
             None => {
-                let home = std::env::var_os("HOME").context("HOME is not set; pass --config")?;
+                // USERPROFILE is the Windows equivalent of HOME.
+                let home = std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .context("HOME is not set; pass --config")?;
                 PathBuf::from(home).join(".config/central/config.json")
             }
         };

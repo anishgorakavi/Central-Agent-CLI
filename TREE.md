@@ -3,6 +3,7 @@
 Terminal UI (mouse-aware) that embeds the real Claude Code, Codex and Antigravity CLIs in terminal panes, chats with custom Ollama/OpenAI-compatible agents over the Agent Client Protocol, and lets agents delegate to each other over A2A (e.g. Claude asking Codex to generate an image).
 
 Cargo.toml             Package manifest and dependencies.
+.github/workflows/release.yml  Builds Windows, macOS and Linux (x64 and arm64) binaries on a v* tag and publishes them as a GitHub release.
 .gitignore             Ignores build output and generated images.
 README.md              Project overview, logo and usage.
 assets/
@@ -15,10 +16,10 @@ src/                   Application code.
   a2a.rs               A2A v1.0 (JSON-RPC over HTTP): server exposing every agent as a task endpoint, and the client used by the MCP bridge.
   mcp_server.rs        MCP bridge given to agents: `delegate` and `generate_image` tools that call other agents through A2A.
   custom_agent.rs      ACP agent server that answers prompts with an LLM; the custom harness.
-  llm.rs               Streaming chat requests to Ollama and OpenAI-compatible endpoints.
+  llm.rs               Streaming chat requests to Ollama and OpenAI-compatible endpoints, and listing installed Ollama models.
   event.rs             Messages from background threads to the TUI, and the permission bridge (auto-approve or ask the user), and delegation progress shown in the target agent's tab.
   worker.rs            Thread owning one agent's ACP connection for a chat tab; handles prompt, list-sessions, resume and new-session commands.
-  app.rs               TUI state: tabs (embedded terminals or chat), input editing, key/mouse routing, Ctrl+] chord, /resume and /new commands, session picker, permission queue.
+  app.rs               TUI state: tabs (embedded terminals or chat), input editing, key/mouse routing, Ctrl+] chord, /resume, /new and /model commands, session picker, permission queue.
   ui.rs                TUI rendering: sidebar, embedded terminal painting, chat transcript, A2A activity, message box, status bar, permission dialog, session picker dialog, click targets.
   tui.rs               Terminal setup/teardown (raw mode, mouse capture, bracketed paste) and the event loop.
   pty_pane.rs          Embedded terminal: a real CLI on a pseudo-terminal plus a vt100 emulator holding its screen.

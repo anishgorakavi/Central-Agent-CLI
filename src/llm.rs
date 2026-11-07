@@ -79,6 +79,25 @@ pub fn stream_chat(
     Ok(())
 }
 
+/// Names of the models installed in the Ollama server at `base_url`.
+pub fn ollama_models(base_url: &str) -> Result<Vec<String>> {
+    let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    let agent = ureq::AgentBuilder::new().timeout(CONNECT_TIMEOUT).build();
+    let tags: Value = agent
+        .get(&url)
+        .call()
+        .with_context(|| format!("calling {url}"))?
+        .into_json()
+        .context("Ollama tag list is not JSON")?;
+    Ok(tags["models"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|model| model["name"].as_str().map(str::to_owned))
+        .collect())
+}
+
 type LineParser = fn(&str) -> Result<Option<String>>;
 
 /// Extracts the text delta from one Ollama NDJSON line; None for lines without text.

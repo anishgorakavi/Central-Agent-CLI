@@ -253,7 +253,11 @@ fn status_color(status: Status) -> Color {
 /// The selected agent's transcript, bottom-anchored and scrollable.
 fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
     let chat = &app.chats[app.selected];
-    let title = format!(" {} - {} ", chat.name, status_label(chat.status));
+    let label = match app.model_label(app.selected) {
+        Some(model) => format!("{} ({model})", chat.name),
+        None => chat.name.clone(),
+    };
+    let title = format!(" {label} - {} ", status_label(chat.status));
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);

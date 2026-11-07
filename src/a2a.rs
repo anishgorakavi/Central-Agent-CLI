@@ -40,9 +40,7 @@ struct State {
 /// Generates a random bearer token (128 bits, hex) from the OS entropy source.
 pub fn new_token() -> Result<String> {
     let mut bytes = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .context("reading /dev/urandom")?;
+    getrandom::fill(&mut bytes).map_err(|error| anyhow!("reading OS entropy: {error}"))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
