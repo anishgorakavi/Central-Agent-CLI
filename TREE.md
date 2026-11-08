@@ -6,6 +6,8 @@ Cargo.toml             Package manifest and dependencies.
 .github/workflows/release.yml  Builds Windows, macOS and Linux (x64 and arm64) binaries on a v* tag and publishes them as a GitHub release.
 .gitignore             Ignores build output and generated images.
 README.md              Project overview, logo and usage.
+AGENTS.md              Guidance for AI agents and contributors: architecture, conventions, gotchas, safety.
+CLAUDE.md              Claude Code entry point: imports AGENTS.md and adds Claude-specific working rules.
 assets/
   logo.png             Project logo, generated with Codex (model gpt-6-sol).
 src/                   Application code.
